@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,15 +27,26 @@ import (
 var (
 	targetPID  int
 	targetComm string
+	targetIP   string
+	parsedIP   net.IP // 用于存储解析后的 targetIP
 )
 
 func init() {
 	flag.IntVar(&targetPID, "pid", 0, "Filter by PID")
-	flag.StringVar(&targetComm, "comm", "", "Filter by process name")
+	flag.StringVar(&targetComm, "comm", "", "Filter by process name (substring)")
+	flag.StringVar(&targetIP, "ip", "", "Filter by destination IP address")
 }
 
 func main() {
 	flag.Parse()
+
+	// 预先解析 IP 参数，避免在循环中重复解析
+	if targetIP != "" {
+		parsedIP = net.ParseIP(targetIP)
+		if parsedIP == nil {
+			log.Fatalf("Invalid IP address format: %s", targetIP)
+		}
+	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
@@ -44,7 +58,7 @@ func main() {
 	}
 	defer objs.Close()
 
-	// --- Tracepoints ---
+	// --- 挂载 Tracepoints ---
 	kpConnect, err := link.Tracepoint("syscalls", "sys_enter_connect", objs.TraceConnect, nil)
 	if err != nil { log.Fatalf("trace connect: %v", err) }
 	defer kpConnect.Close()
@@ -65,8 +79,12 @@ func main() {
 	if err != nil { log.Fatalf("ringbuf: %v", err) }
 	defer rd.Close()
 
+	// 打印表头
 	fmt.Printf("%-20s %-7s %-5s %-25s %s\n", "TIME", "PID", "PROTO", "DESTINATION", "COMMAND LINE")
 	fmt.Println(strings.Repeat("-", 120))
+
+	// 1. 快照扫描已存在连接 (支持 IP 过滤)
+	go snapshotExistingConnections()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -84,26 +102,31 @@ func main() {
 				continue
 			}
 
-			// --- 处理命令行 ---
-			// BPF 发来的是原始字节，包含 \0。例如 [c,u,r,l,\0,e,x,a,m,p,l,e,\0]
-			// 我们将有效负载提取出来，并将中间的 \0 替换为空格
-			
-			// 1. 找到有效数据的截止点（去除尾部全是0的填充区）
+			// --- IP Filter (内核事件流) ---
+			var eventIP net.IP
+			if event.Af == 2 { // AF_INET
+				eventIP = net.IP(event.Ip[0:4])
+			} else { // AF_INET6
+				eventIP = net.IP(event.Ip[:])
+			}
+
+			// 如果设置了 IP 过滤，且不匹配，则跳过
+			if parsedIP != nil && !eventIP.Equal(parsedIP) {
+				continue
+			}
+
+			// --- PID Filter ---
+			if targetPID != 0 && int(event.Pid) != targetPID { continue }
+
+			// --- Command Filter & Processing ---
 			cmdBuf := event.Cmd[:]
-			// 简单处理：将所有 \0 替换为空格，然后Trim掉首尾空格
-			// 注意：cmdBuf 可能中间有 \0 (分隔参数)，末尾有一大堆 \0 (padding)
-			
-			// 为了显示美观，我们先转成 byte slice 处理
 			cleanCmd := bytes.ReplaceAll(cmdBuf, []byte{0}, []byte(" "))
 			finalCmd := string(bytes.TrimSpace(cleanCmd))
-
-			// 如果是回退到 comm 的情况，comm 只有 16 字节且没有空格分隔，逻辑也是兼容的
-
-			// --- Filter ---
-			if targetPID != 0 && int(event.Pid) != targetPID { continue }
+			
 			if targetComm != "" && !strings.Contains(finalCmd, targetComm) { continue }
 
-			printLine(event, finalCmd)
+			// --- Print ---
+			printLine(event, eventIP, finalCmd, false)
 		}
 	}()
 
@@ -111,13 +134,7 @@ func main() {
 	fmt.Println("\nExiting...")
 }
 
-func printLine(e bpfEventT, cmdline string) {
-	var ip net.IP
-	if e.Af == 2 {
-		ip = net.IP(e.Ip[0:4])
-	} else {
-		ip = net.IP(e.Ip[:])
-	}
+func printLine(e bpfEventT, ip net.IP, cmdline string, isSnapshot bool) {
 	port := (e.Port<<8 | e.Port>>8)
 	dest := fmt.Sprintf("%s:%d", ip.String(), port)
 
@@ -128,5 +145,151 @@ func printLine(e bpfEventT, cmdline string) {
 	}
 
 	ts := time.Now().Format("15:04:05.000")
-	fmt.Printf("%-20s %-7d %-5s %-25s %s\n", ts, e.Pid, proto, dest, cmdline)
+	suffix := ""
+	if isSnapshot {
+		suffix = " (EXISTING)"
+	}
+	fmt.Printf("%-20s %-7d %-5s %-25s %s%s\n", ts, e.Pid, proto, dest, cmdline, suffix)
+}
+
+// --- 快照功能 ---
+
+func snapshotExistingConnections() {
+	// map[inode] = "IP:Port"
+	socketMap := make(map[string]string)
+	parseProcNet("/proc/net/tcp", socketMap, false)
+	parseProcNet("/proc/net/tcp6", socketMap, true)
+
+	if len(socketMap) == 0 { return }
+
+	procDir, err := os.Open("/proc")
+	if err != nil { return }
+	defer procDir.Close()
+
+	pids, err := procDir.Readdirnames(-1)
+	if err != nil { return }
+
+	for _, pidStr := range pids {
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil { continue }
+		if targetPID != 0 && pid != targetPID { continue }
+
+		fdPath := fmt.Sprintf("/proc/%s/fd", pidStr)
+		entries, err := os.ReadDir(fdPath)
+		if err != nil { continue }
+
+		cmdline := ""
+
+		for _, entry := range entries {
+			link, err := os.Readlink(filepath.Join(fdPath, entry.Name()))
+			if err != nil { continue }
+
+			if strings.HasPrefix(link, "socket:[") {
+				inode := link[8 : len(link)-1]
+				if dest, ok := socketMap[inode]; ok {
+					
+					// --- IP Filter (快照) ---
+					if parsedIP != nil {
+						// dest 格式为 "IP:Port"，需要拆分
+						host, _, err := net.SplitHostPort(dest)
+						if err != nil { continue }
+						
+						connIP := net.ParseIP(host)
+						if !connIP.Equal(parsedIP) {
+							continue
+						}
+					}
+
+					// 获取 Cmdline
+					if cmdline == "" {
+						cmdline = getProcCmdline(pid)
+						if cmdline == "" {
+							 commBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%s/comm", pidStr))
+							 cmdline = strings.TrimSpace(string(commBytes))
+						}
+						// Comm Filter
+						if targetComm != "" && !strings.Contains(cmdline, targetComm) {
+							cmdline = "SKIP"
+						}
+					}
+
+					if cmdline != "SKIP" {
+						ts := time.Now().Format("15:04:05.000")
+						fmt.Printf("%-20s %-7d %-5s %-25s %s (EXISTING)\n", 
+							ts, pid, "TCP", dest, cmdline)
+					}
+				}
+			}
+		}
+	}
+}
+
+func getProcCmdline(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil { return "" }
+	res := bytes.ReplaceAll(data, []byte{0}, []byte(" "))
+	return string(bytes.TrimSpace(res))
+}
+
+func parseProcNet(path string, res map[string]string, isV6 bool) {
+	file, err := os.Open(path)
+	if err != nil { return }
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Scan() 
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 10 { continue }
+
+		if fields[3] != "01" { continue } // Only ESTABLISHED
+
+		remAddrHex := fields[2]
+		inode := fields[9]
+
+		ipPort, err := hexToIPPort(remAddrHex, isV6)
+		if err == nil {
+			res[inode] = ipPort
+		}
+	}
+}
+
+func hexToIPPort(hexStr string, isV6 bool) (string, error) {
+	parts := strings.Split(hexStr, ":")
+	if len(parts) != 2 { return "", fmt.Errorf("invalid format") }
+
+	portVal, err := strconv.ParseInt(parts[1], 16, 32)
+	if err != nil { return "", err }
+
+	ipHex := parts[0]
+	var ip net.IP
+
+	if !isV6 {
+		ipBytes, err := hexDecode(ipHex)
+		if err != nil || len(ipBytes) != 4 { return "", fmt.Errorf("bad ipv4") }
+		ip = net.IP{ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0]}
+	} else {
+		ipBytes, err := hexDecode(ipHex)
+		if err != nil || len(ipBytes) != 16 { return "", fmt.Errorf("bad ipv6") }
+		// IPv6 in /proc is 4x 32bit Little Endian ints
+		ip = make(net.IP, 16)
+		for i := 0; i < 4; i++ {
+			for j := 0; j < 4; j++ {
+				ip[i*4+j] = ipBytes[i*4+3-j]
+			}
+		}
+	}
+	return fmt.Sprintf("%s:%d", ip.String(), portVal), nil
+}
+
+func hexDecode(s string) ([]byte, error) {
+	if len(s)%2 != 0 { return nil, fmt.Errorf("bad length") }
+	data := make([]byte, len(s)/2)
+	for i := 0; i < len(s); i += 2 {
+		val, err := strconv.ParseUint(s[i:i+2], 16, 8)
+		if err != nil { return nil, err }
+		data[i/2] = byte(val)
+	}
+	return data, nil
 }
