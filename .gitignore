@@ -1,0 +1,35 @@
+# --- 二进制文件 ---
+netmonitor
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# --- Go 编译中间文件 ---
+bin/
+obj/
+*.test
+*.out
+
+# --- eBPF 自动生成的代码 (由 bpf2go 生成) ---
+# 这些文件通常在执行 go generate 后自动生成，不建议提交到版本控制
+bpf_bpfel.go
+bpf_x86_bpfel.go
+bpf_bpfel.o
+bpf_x86_bpfel.o
+bpf_bpfeb.go
+bpf_86_bpfeb.go
+bpf_bpfeb.o
+bpf_x86_bpfeb.o
+
+# --- 内核头文件 ---
+# vmlinux.h 是从当前系统提取的，不应提交，因为其他系统的内核结构可能不同
+headers/vmlinux.h
+
+# --- 编辑器 & 系统文件 ---
+*.swp
+*.swo
+
+# --- Go 依赖 ---
+go.sum
