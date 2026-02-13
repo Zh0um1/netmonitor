@@ -26,5 +26,3 @@ headers/vmlinux.h
 *.swp
 *.swo
 
-# --- Go 依赖 ---
-go.sum
